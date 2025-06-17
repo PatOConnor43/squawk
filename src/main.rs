@@ -220,6 +220,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+async fn lsp_references(
+    client: &LspClient,
+    uri: &lsp_types::Uri,
+    line: usize,
+    column: usize,
+) -> Result<Vec<lsp_types::Location>> {
+    let references = client
+        .send_request::<lsp_types::request::References>(lsp_types::ReferenceParams {
+            text_document_position: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: lsp_types::Position {
+                    line: line as u32,
+                    character: column as u32,
+                },
+            },
+            context: lsp_types::ReferenceContext {
+                include_declaration: false,
+            },
+            work_done_progress_params: lsp_types::WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: lsp_types::PartialResultParams {
+                partial_result_token: None,
+            },
+        })
+        .await?;
+    Ok(references.unwrap_or_default())
+}
+
+async fn lsp_hover(
+    client: &LspClient,
+    uri: &lsp_types::Uri,
+    line: usize,
+    column: usize,
+) -> Result<lsp_types::Hover> {
+    let hover = client
+        .send_request::<lsp_types::request::HoverRequest>(lsp_types::HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: lsp_types::Position {
+                    line: line as u32,
+                    character: column as u32,
+                },
+            },
+            work_done_progress_params: lsp_types::WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        })
+        .await?;
+    if hover.is_none() {
+        return Err(anyhow::anyhow!("No hover information found"));
+    }
+    Ok(hover.unwrap())
+}
 
 async fn get_entry_variables(go_file: &Path, client: &LspClient) -> Vec<EntryVariable> {
     let mut variables = vec![];
@@ -255,26 +309,7 @@ async fn get_entry_variables(go_file: &Path, client: &LspClient) -> Vec<EntryVar
     }
     let ranges = ranges.unwrap();
     for range in ranges {
-        let references = client
-            .send_request::<lsp_types::request::References>(lsp_types::ReferenceParams {
-                text_document_position: lsp_types::TextDocumentPositionParams {
-                    text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
-                    position: lsp_types::Position {
-                        line: range.line_start as u32,
-                        character: range.column_start as u32,
-                    },
-                },
-                context: lsp_types::ReferenceContext {
-                    include_declaration: false,
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams {
-                    work_done_token: None,
-                },
-                partial_result_params: lsp_types::PartialResultParams {
-                    partial_result_token: None,
-                },
-            })
-            .await;
+        let references = lsp_references(client, &uri, range.line_start, range.column_start).await;
         if references.is_err() {
             warn!(
                 file = go_file.to_str(),
@@ -283,10 +318,6 @@ async fn get_entry_variables(go_file: &Path, client: &LspClient) -> Vec<EntryVar
                 cause = ?references.err().unwrap(),
                 "Failed to get references",
             );
-            continue;
-        }
-        let references = references.unwrap();
-        if references.is_none() {
             continue;
         }
         let references = references.unwrap();
@@ -331,26 +362,7 @@ async fn get_entry_variables(go_file: &Path, client: &LspClient) -> Vec<EntryVar
         if let search::TreeSitterSemanticParentRange::ShortVarDeclaration(line, column) =
             semantic_parent_range
         {
-            let references = client
-                .send_request::<lsp_types::request::References>(lsp_types::ReferenceParams {
-                    text_document_position: lsp_types::TextDocumentPositionParams {
-                        text_document: lsp_types::TextDocumentIdentifier { uri: r.uri.clone() },
-                        position: lsp_types::Position {
-                            line: line as u32,
-                            character: column as u32,
-                        },
-                    },
-                    context: lsp_types::ReferenceContext {
-                        include_declaration: false,
-                    },
-                    work_done_progress_params: lsp_types::WorkDoneProgressParams {
-                        work_done_token: None,
-                    },
-                    partial_result_params: lsp_types::PartialResultParams {
-                        partial_result_token: None,
-                    },
-                })
-                .await;
+            let references = lsp_references(client, &r.uri.clone(), line, column).await;
             if references.is_err() {
                 warn!(
                     file = go_file.to_str(),
@@ -362,11 +374,6 @@ async fn get_entry_variables(go_file: &Path, client: &LspClient) -> Vec<EntryVar
                 continue;
             }
             let references = references.unwrap();
-            if references.is_none() {
-                continue;
-            }
-            let references = references.unwrap();
-            dbg!(&references);
 
             let r = references[0].clone();
             info!(
@@ -385,7 +392,7 @@ async fn get_entry_variables(go_file: &Path, client: &LspClient) -> Vec<EntryVar
 async fn get_logging_invocations(go_file: &Path, client: &LspClient) -> Vec<LoggingInvocation> {
     let mut invocations = vec![];
     let go_file_str = go_file.to_string_lossy();
-    let content = std::fs::read_to_string(&go_file);
+    let content = std::fs::read_to_string(go_file);
     if content.is_err() {
         error!(
             file = go_file.to_str(),
@@ -416,20 +423,13 @@ async fn get_logging_invocations(go_file: &Path, client: &LspClient) -> Vec<Logg
     }
     let ranges = ranges.unwrap();
     for logging_function in ranges {
-        let hover = client
-            .send_request::<lsp_types::request::HoverRequest>(lsp_types::HoverParams {
-                text_document_position_params: lsp_types::TextDocumentPositionParams {
-                    text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
-                    position: lsp_types::Position {
-                        line: logging_function.line_start as u32,
-                        character: logging_function.column_start as u32,
-                    },
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams {
-                    work_done_token: None,
-                },
-            })
-            .await;
+        let hover = lsp_hover(
+            client,
+            &uri,
+            logging_function.line_start,
+            logging_function.column_start,
+        )
+        .await;
         if hover.is_err() {
             warn!(
                 file = go_file.to_str(),
@@ -438,10 +438,6 @@ async fn get_logging_invocations(go_file: &Path, client: &LspClient) -> Vec<Logg
                 cause = ?hover.err().unwrap(),
                 "Failed to get hover information",
             );
-            continue;
-        }
-        let hover = hover.unwrap();
-        if hover.is_none() {
             continue;
         }
         let hover = hover.unwrap();
@@ -538,6 +534,13 @@ async fn get_with_field_invocations(
                 },
             })
             .await;
+        let hover = lsp_hover(
+            client,
+            &uri,
+            with_field_function.line_start,
+            with_field_function.column_start,
+        )
+        .await;
         if hover.is_err() {
             warn!(
                 file = go_file.to_str(),
@@ -546,10 +549,6 @@ async fn get_with_field_invocations(
                 cause = ?hover.err().unwrap(),
                 "Failed to get hover information",
             );
-            continue;
-        }
-        let hover = hover.unwrap();
-        if hover.is_none() {
             continue;
         }
         let hover = hover.unwrap();
