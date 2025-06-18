@@ -3,6 +3,8 @@ mod search;
 use anyhow::{Context, Result};
 use lsp_client::{LspClient, transport::io_transport};
 use regex_lite::Regex;
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::{path::PathBuf, process::Stdio, str::FromStr};
@@ -33,6 +35,7 @@ struct LoggingInvocation {
     line_end: usize,
     line_start: usize,
     message: String,
+    uri: String,
 }
 
 #[derive(Debug)]
@@ -58,6 +61,7 @@ struct WithFieldInvocation {
     line_end: usize,
     line_start: usize,
     value: String,
+    uri: String,
 }
 
 #[derive(Debug)]
@@ -67,6 +71,23 @@ struct EntryVariable {
     line_end: usize,
     line_start: usize,
     name: String,
+}
+
+struct FinializedLog {
+    message: String,
+    level: LoggingInvocationLevel,
+    fields: Vec<FinalizedLoggingField>,
+}
+struct FinalizedLoggingField {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PointMarker {
+    Logger,
+    Field,
+    Message,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +235,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .context("failed to receive indexing notification")?;
 
+    let mut log_invocations = vec![];
+    let mut with_field_invocations = vec![];
     let mut logger_aliases = vec![];
     let go_files = std::fs::read_dir(path)
         .context("failed to read directory")?
@@ -222,12 +245,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|entry| entry.path())
         .collect::<Vec<_>>();
     for go_file in go_files {
-        let log_invocations = get_logging_invocations(go_file.as_path(), &client).await;
-        let with_field_invocations = get_with_field_invocations(go_file.as_path(), &client).await;
+        let inner_log_invocations = get_logging_invocations(go_file.as_path(), &client).await;
+        let inner_with_field_invocations =
+            get_with_field_invocations(go_file.as_path(), &client).await;
         let inner_logger_aliases = get_logger_aliases(go_file.as_path(), &client).await;
+
+        log_invocations.extend(inner_log_invocations);
+        with_field_invocations.extend(inner_with_field_invocations);
         logger_aliases.extend(inner_logger_aliases);
     }
-    dbg!(&logger_aliases);
+    let mut logger_alias_markers = HashMap::new();
+    for alias in &logger_aliases {
+        logger_alias_markers.insert(
+            format!("{}:{}", alias.identifier.uri, alias.identifier.line_start),
+            PointMarker::Logger,
+        );
+    }
+
+    for alias in &logger_aliases {
+        let mut state: HashMap<String, String> = HashMap::new();
+
+        let mut interesting_fields = with_field_invocations
+            .iter()
+            .filter(|inv| inv.uri == alias.identifier.uri)
+            .filter(|inv| inv.line_start >= alias.identifier.line_start)
+            .collect::<Vec<_>>();
+        interesting_fields
+            .sort_by(|a, b| (a.line_start, a.column_start).cmp(&(b.line_start, b.column_start)));
+        let mut current_point = (alias.identifier.line_start, alias.identifier.column_start);
+        for inv in &interesting_fields {
+            // WithField is on the same line as the alias
+            if current_point.0 == inv.line_start && current_point.1 <= inv.column_start {
+                // We can consider this WithField invocation as a field for the alias.
+                state.insert(inv.key.clone(), inv.value.clone());
+                current_point = (inv.line_start, inv.column_start);
+            }
+            if current_point.0 + 1 == inv.line_start
+                && !logger_alias_markers.contains_key(&format!("{}:{}", inv.uri, inv.line_start))
+            {
+                // In the case where this is None, we can consider this WithField invocation
+                // applying to the same logger.
+
+                state.insert(inv.key.clone(), inv.value.clone());
+                current_point = (inv.line_start, inv.column_start);
+            }
+        }
+    }
 
     client.shutdown().await?;
     client.exit().await?;
@@ -517,12 +580,13 @@ async fn get_logging_invocations(go_file: &Path, client: &LspClient) -> Vec<Logg
                 }
                 let level = level.unwrap();
                 invocations.push(LoggingInvocation {
-                    line_start: logging_function.line_start + 1,
+                    line_start: logging_function.line_start,
                     column_start: logging_function.column_start,
-                    line_end: logging_function.line_end + 1,
+                    line_end: logging_function.line_end,
                     column_end: logging_function.column_end,
                     level,
                     message: logging_function.arguments.clone(),
+                    uri: uri.to_string(),
                 });
             }
         }
@@ -599,9 +663,10 @@ async fn get_with_field_invocations(
                         column_end: with_field_function.column_end,
                         column_start: with_field_function.column_start,
                         key: with_field_function.key,
-                        line_end: with_field_function.line_end + 1,
-                        line_start: with_field_function.line_start + 1,
+                        line_end: with_field_function.line_end,
+                        line_start: with_field_function.line_start,
                         value: with_field_function.value,
+                        uri: uri.to_string(),
                     });
                 }
             }
