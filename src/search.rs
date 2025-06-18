@@ -103,10 +103,7 @@ pub fn find_semantic_parent_range_for_logrus_reference(
     if node.kind() == "identifier" {
         short_var_declaration_path.remove(0);
     } else {
-        return Ok(TreeSitterSemanticParentRange::Identity(
-            line_start,
-            column_start,
-        ));
+        return Ok(TreeSitterSemanticParentRange::Identity);
     }
 
     // The only pathway that is currently supported is go code that looks like this:
@@ -126,18 +123,19 @@ pub fn find_semantic_parent_range_for_logrus_reference(
 
         if short_var_declaration_path.is_empty() {
             return Ok(TreeSitterSemanticParentRange::ShortVarDeclaration(
-                inner.start_position().row,
-                inner.start_position().column,
+                TreeSitterRange {
+                    line_start: inner.start_position().row,
+                    line_end: inner.end_position().row,
+                    column_start: inner.start_position().column,
+                    column_end: inner.end_position().column,
+                },
             ));
         }
 
         n = inner.parent();
     }
 
-    Ok(TreeSitterSemanticParentRange::Identity(
-        line_start,
-        column_start,
-    ))
+    Ok(TreeSitterSemanticParentRange::Identity)
 }
 
 pub fn find_fields(
@@ -331,9 +329,17 @@ pub struct TreeSitterFunctionReturningLogrusEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeSitterSemanticParentRange {
-    ShortVarDeclaration(usize, usize), // (line_start, column_start)
+    ShortVarDeclaration(TreeSitterRange), // (line_start, column_start)
     // Identity is used to signal that this is a terminal node and there is nothing else to find.
-    Identity(usize, usize),
+    Identity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeSitterRange {
+    pub line_start: usize,
+    pub line_end: usize,
+    pub column_start: usize,
+    pub column_end: usize,
 }
 
 pub fn find_logging_function(

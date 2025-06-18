@@ -36,6 +36,21 @@ struct LoggingInvocation {
 }
 
 #[derive(Debug)]
+struct LoggerAlias {
+    identifier: LoggerIdentifier,
+    parent: Option<LoggerIdentifier>,
+}
+
+#[derive(Debug, Clone)]
+struct LoggerIdentifier {
+    column_end: usize,
+    column_start: usize,
+    line_end: usize,
+    line_start: usize,
+    uri: String,
+}
+
+#[derive(Debug)]
 struct WithFieldInvocation {
     column_end: usize,
     column_start: usize,
@@ -157,8 +172,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let initialize = lsp_types::InitializeParams {
-        root_path: Some(path_str.to_string()),
-        root_uri: Some(source_uri.clone()),
         capabilities: lsp_types::ClientCapabilities {
             text_document: Some(lsp_types::TextDocumentClientCapabilities {
                 references: Some(lsp_types::ReferenceClientCapabilities {
@@ -191,7 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }]),
         ..Default::default()
     };
-    let a = client.initialize(initialize).await?;
+    client.initialize(initialize).await?;
     client.initialized().await?;
 
     println!("Initialized gopls");
@@ -201,7 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .context("failed to receive indexing notification")?;
 
-    // Use os.WalkDir to find all Go files in the workspace.
+    let mut logger_aliases = vec![];
     let go_files = std::fs::read_dir(path)
         .context("failed to read directory")?
         .filter_map(Result::ok)
@@ -211,8 +224,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for go_file in go_files {
         let log_invocations = get_logging_invocations(go_file.as_path(), &client).await;
         let with_field_invocations = get_with_field_invocations(go_file.as_path(), &client).await;
-        let entry_variables = get_entry_variables(go_file.as_path(), &client).await;
+        let inner_logger_aliases = get_logger_aliases(go_file.as_path(), &client).await;
+        logger_aliases.extend(inner_logger_aliases);
     }
+    dbg!(&logger_aliases);
 
     client.shutdown().await?;
     client.exit().await?;
@@ -275,17 +290,17 @@ async fn lsp_hover(
     Ok(hover.unwrap())
 }
 
-async fn get_entry_variables(go_file: &Path, client: &LspClient) -> Vec<EntryVariable> {
-    let mut variables = vec![];
+async fn get_logger_aliases(go_file: &Path, client: &LspClient) -> Vec<LoggerAlias> {
+    let mut logger_aliases = vec![];
     let go_file_str = go_file.to_string_lossy();
-    let content = std::fs::read_to_string(&go_file);
+    let content = std::fs::read_to_string(go_file);
     if content.is_err() {
         error!(
             file = go_file.to_str(),
             cause = ?content.err().unwrap(),
             "Failed to read file",
         );
-        return variables;
+        return logger_aliases;
     }
     let content = content.unwrap();
     let uri = lsp_types::Uri::from_str(&format!("file://{}", go_file_str));
@@ -295,7 +310,7 @@ async fn get_entry_variables(go_file: &Path, client: &LspClient) -> Vec<EntryVar
             cause = ?uri.err().unwrap(),
             "Failed to create URI for Language Server Protocol",
         );
-        return variables;
+        return logger_aliases;
     }
     let uri = uri.unwrap();
     let ranges = search::find_functions_returning_logrus_entry(&content, &go_file_str);
@@ -305,88 +320,121 @@ async fn get_entry_variables(go_file: &Path, client: &LspClient) -> Vec<EntryVar
             cause = ?ranges.err().unwrap(),
             "Failed to find logging function invocations",
         );
-        return variables;
+        return logger_aliases;
     }
     let ranges = ranges.unwrap();
     for range in ranges {
-        let references = lsp_references(client, &uri, range.line_start, range.column_start).await;
+        let logger_parent = LoggerIdentifier {
+            column_end: range.column_end,
+            column_start: range.column_start,
+            line_end: range.line_end,
+            line_start: range.line_start,
+            uri: uri.to_string(),
+        };
+        let inner_logger_aliases = resolve_loggers(client, logger_parent).await;
+        logger_aliases.extend(inner_logger_aliases);
+    }
+
+    logger_aliases
+}
+
+async fn resolve_loggers(client: &LspClient, parent: LoggerIdentifier) -> Vec<LoggerAlias> {
+    Box::pin(async move {
+        let mut boxed_logger_aliases = vec![];
+        let uri = lsp_types::Uri::from_str(&parent.uri).unwrap();
+        let references = lsp_references(client, &uri, parent.line_start, parent.column_start).await;
         if references.is_err() {
             warn!(
-                file = go_file.to_str(),
-                line_start = range.line_start,
-                column_start = range.column_start,
+                file = parent.uri.to_string().as_str(),
+                line_start = parent.line_start,
+                column_start = parent.column_start,
                 cause = ?references.err().unwrap(),
                 "Failed to get references",
             );
-            continue;
+            return boxed_logger_aliases;
         }
         let references = references.unwrap();
-
-        let r = references[0].clone();
-        info!(
-            file = r.uri.to_string().as_str(),
-            line_start = r.range.start.line,
-            column_start = r.range.start.character,
-            "Found references: {:?}",
-            r,
-        );
-        let ref_filepath = r.uri.path().to_string();
-        let content = std::fs::read_to_string(&ref_filepath);
-        if content.is_err() {
-            warn!(
-                file = r.uri.to_string(),
-                cause = ?content.err().unwrap(),
-                "Failed to read file for references",
+        for lsp_ref in references {
+            debug!(
+                file = lsp_ref.uri.to_string().as_str(),
+                line_start = lsp_ref.range.start.line,
+                column_start = lsp_ref.range.start.character,
+                "Found references: {:?}",
+                lsp_ref,
             );
-            continue;
-        }
-        let content = content.unwrap();
-        let semantic_parent_range = search::find_semantic_parent_range_for_logrus_reference(
-            &content,
-            r.range.start.line as usize,
-            r.range.end.line as usize,
-            r.range.start.character as usize,
-            r.range.end.character as usize,
-            &ref_filepath,
-        );
-        if semantic_parent_range.is_err() {
-            warn!(
-                file = r.uri.to_string(),
-                cause = ?semantic_parent_range.err().unwrap(),
-                "Failed to find semantic parent range for logrus reference",
-            );
-            continue;
-        }
-        let semantic_parent_range = semantic_parent_range.unwrap();
-        dbg!(&semantic_parent_range);
-        if let search::TreeSitterSemanticParentRange::ShortVarDeclaration(line, column) =
-            semantic_parent_range
-        {
-            let references = lsp_references(client, &r.uri.clone(), line, column).await;
-            if references.is_err() {
+            let ref_filepath = lsp_ref.uri.path().to_string();
+            let content = std::fs::read_to_string(&ref_filepath);
+            if content.is_err() {
                 warn!(
-                    file = go_file.to_str(),
-                    line_start = range.line_start,
-                    column_start = range.column_start,
-                    cause = ?references.err().unwrap(),
-                    "Failed to get references",
+                    file = lsp_ref.uri.to_string(),
+                    cause = ?content.err().unwrap(),
+                    "Failed to read file for references",
                 );
                 continue;
             }
-            let references = references.unwrap();
-
-            let r = references[0].clone();
-            info!(
-                file = r.uri.to_string().as_str(),
-                line_start = r.range.start.line,
-                column_start = r.range.start.character,
-                "Found second references: {:?}",
-                r,
+            let content = content.unwrap();
+            let semantic_parent_range = search::find_semantic_parent_range_for_logrus_reference(
+                &content,
+                lsp_ref.range.start.line as usize,
+                lsp_ref.range.end.line as usize,
+                lsp_ref.range.start.character as usize,
+                lsp_ref.range.end.character as usize,
+                &ref_filepath,
             );
+            if semantic_parent_range.is_err() {
+                warn!(
+                    file = lsp_ref.uri.to_string(),
+                    cause = ?semantic_parent_range.err().unwrap(),
+                    "Failed to find semantic parent range for logrus reference",
+                );
+                continue;
+            }
+            let semantic_parent_range = semantic_parent_range.unwrap();
+            match semantic_parent_range {
+                search::TreeSitterSemanticParentRange::ShortVarDeclaration(range) => {
+                    let references =
+                        lsp_references(client, &lsp_ref.uri, range.line_start, range.column_start)
+                            .await;
+                    if references.is_err() {
+                        warn!(
+                            file = lsp_ref.uri.to_string(),
+                            line_start = lsp_ref.range.start.line,
+                            column_start = lsp_ref.range.start.character,
+                            cause = ?references.err().unwrap(),
+                            "Failed to get references",
+                        );
+                        return boxed_logger_aliases;
+                    }
+                    let references = references.unwrap();
+                    for lsp_ref in references {
+                        let parent = LoggerIdentifier {
+                            column_end: range.column_end,
+                            column_start: range.column_start,
+                            line_end: range.line_end,
+                            line_start: range.line_start,
+                            uri: lsp_ref.uri.to_string(),
+                        };
+                        let inner_aliases = resolve_loggers(client, parent).await;
+                        boxed_logger_aliases.extend(inner_aliases);
+                    }
+                }
+                search::TreeSitterSemanticParentRange::Identity => {
+                    boxed_logger_aliases.push(LoggerAlias {
+                        identifier: LoggerIdentifier {
+                            column_end: lsp_ref.range.end.character as usize,
+                            column_start: lsp_ref.range.start.character as usize,
+                            line_end: lsp_ref.range.end.line as usize,
+                            line_start: lsp_ref.range.start.line as usize,
+                            uri: lsp_ref.uri.to_string(),
+                        },
+                        parent: Some(parent.clone()),
+                    });
+                }
+            }
         }
-    }
-
-    variables
+        boxed_logger_aliases
+    })
+    .await
 }
 
 async fn get_logging_invocations(go_file: &Path, client: &LspClient) -> Vec<LoggingInvocation> {
@@ -489,7 +537,7 @@ async fn get_with_field_invocations(
 ) -> Vec<WithFieldInvocation> {
     let mut invocations = vec![];
     let go_file_str = go_file.to_string_lossy();
-    let content = std::fs::read_to_string(&go_file);
+    let content = std::fs::read_to_string(go_file);
     if content.is_err() {
         error!(
             file = go_file.to_str(),
@@ -520,20 +568,6 @@ async fn get_with_field_invocations(
     }
     let ranges = ranges.unwrap();
     for with_field_function in ranges {
-        let hover = client
-            .send_request::<lsp_types::request::HoverRequest>(lsp_types::HoverParams {
-                text_document_position_params: lsp_types::TextDocumentPositionParams {
-                    text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
-                    position: lsp_types::Position {
-                        line: with_field_function.line_start as u32,
-                        character: with_field_function.column_start as u32,
-                    },
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams {
-                    work_done_token: None,
-                },
-            })
-            .await;
         let hover = lsp_hover(
             client,
             &uri,
