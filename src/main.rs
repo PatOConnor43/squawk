@@ -254,6 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         with_field_invocations.extend(inner_with_field_invocations);
         logger_aliases.extend(inner_logger_aliases);
     }
+    dbg!(&logger_aliases);
     let mut logger_alias_markers = HashMap::new();
     for alias in &logger_aliases {
         logger_alias_markers.insert(
@@ -262,35 +263,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Build direct state for each logger alias
+    let get_logger_state_for_identifier =
+        |identifier: &LoggerIdentifier| -> HashMap<String, String> {
+            let mut state: HashMap<String, String> = HashMap::new();
+
+            let mut interesting_fields = with_field_invocations
+                .iter()
+                .filter(|inv| inv.uri == identifier.uri)
+                .filter(|inv| inv.line_start >= identifier.line_start)
+                .collect::<Vec<_>>();
+            interesting_fields.sort_by(|a, b| {
+                (a.line_start, a.column_start).cmp(&(b.line_start, b.column_start))
+            });
+            let mut current_point = (identifier.line_start, identifier.column_start);
+            for inv in &interesting_fields {
+                // WithField is on the same line as the alias
+                if current_point.0 == inv.line_start && current_point.1 <= inv.column_start {
+                    // We can consider this WithField invocation as a field for the alias.
+                    state.insert(inv.key.clone(), inv.value.clone());
+                    current_point = (inv.line_start, inv.column_start);
+                }
+                if current_point.0 + 1 == inv.line_start
+                    && !logger_alias_markers
+                        .contains_key(&format!("{}:{}", inv.uri, inv.line_start))
+                {
+                    // In the case where this is None, we can consider this WithField invocation
+                    // applying to the same logger.
+
+                    state.insert(inv.key.clone(), inv.value.clone());
+                    current_point = (inv.line_start, inv.column_start);
+                }
+            }
+            state
+        };
+    let mut logger_states: HashMap<String, HashMap<String, String>> = HashMap::new();
     for alias in &logger_aliases {
-        let mut state: HashMap<String, String> = HashMap::new();
-
-        let mut interesting_fields = with_field_invocations
-            .iter()
-            .filter(|inv| inv.uri == alias.identifier.uri)
-            .filter(|inv| inv.line_start >= alias.identifier.line_start)
-            .collect::<Vec<_>>();
-        interesting_fields
-            .sort_by(|a, b| (a.line_start, a.column_start).cmp(&(b.line_start, b.column_start)));
-        let mut current_point = (alias.identifier.line_start, alias.identifier.column_start);
-        for inv in &interesting_fields {
-            // WithField is on the same line as the alias
-            if current_point.0 == inv.line_start && current_point.1 <= inv.column_start {
-                // We can consider this WithField invocation as a field for the alias.
-                state.insert(inv.key.clone(), inv.value.clone());
-                current_point = (inv.line_start, inv.column_start);
+        let mut state = HashMap::new();
+        let mut parent_option = &alias.parent;
+        while let Some(parent) = parent_option {
+            let new_parent = logger_aliases.iter().find(|a| {
+                a.identifier.uri == parent.uri
+                    && a.identifier.line_start == parent.line_start
+                    && a.identifier.column_start == parent.column_start
+            });
+            if new_parent.is_none() {
+                parent_option = &None;
+            } else {
+                parent_option = &new_parent.unwrap().parent;
             }
-            if current_point.0 + 1 == inv.line_start
-                && !logger_alias_markers.contains_key(&format!("{}:{}", inv.uri, inv.line_start))
-            {
-                // In the case where this is None, we can consider this WithField invocation
-                // applying to the same logger.
-
-                state.insert(inv.key.clone(), inv.value.clone());
-                current_point = (inv.line_start, inv.column_start);
-            }
+            let parent_state = get_logger_state_for_identifier(parent);
+            state.extend(parent_state);
         }
+        let this_state = get_logger_state_for_identifier(&alias.identifier);
+        state.extend(this_state);
+        let logger_key = format!(
+            "{}:{}:{}",
+            alias.identifier.uri, alias.identifier.line_start, alias.identifier.column_start
+        );
+        logger_states.entry(logger_key).or_default().extend(state);
     }
+    dbg!(&logger_states);
 
     client.shutdown().await?;
     client.exit().await?;
@@ -394,16 +427,36 @@ async fn get_logger_aliases(go_file: &Path, client: &LspClient) -> Vec<LoggerAli
             line_start: range.line_start,
             uri: uri.to_string(),
         };
-        let inner_logger_aliases = resolve_loggers(client, logger_parent).await;
+        let mut resolved_references = vec![];
+        let inner_logger_aliases =
+            resolve_loggers(client, logger_parent, true, &mut resolved_references).await;
         logger_aliases.extend(inner_logger_aliases);
     }
 
     logger_aliases
 }
 
-async fn resolve_loggers(client: &LspClient, parent: LoggerIdentifier) -> Vec<LoggerAlias> {
+async fn resolve_loggers(
+    client: &LspClient,
+    parent: LoggerIdentifier,
+    root: bool,
+    resolved_references: &mut Vec<String>,
+) -> Vec<LoggerAlias> {
     Box::pin(async move {
         let mut boxed_logger_aliases = vec![];
+        if resolved_references.contains(&format!(
+            "{}:{}:{}",
+            parent.uri, parent.line_start, parent.column_start
+        )) {
+            debug!(
+                file = parent.uri.to_string().as_str(),
+                line_start = parent.line_start,
+                column_start = parent.column_start,
+                "Skipping already resolved reference: {:?}",
+                parent,
+            );
+            return boxed_logger_aliases;
+        }
         let uri = lsp_types::Uri::from_str(&parent.uri).unwrap();
         let references = lsp_references(client, &uri, parent.line_start, parent.column_start).await;
         if references.is_err() {
@@ -418,6 +471,10 @@ async fn resolve_loggers(client: &LspClient, parent: LoggerIdentifier) -> Vec<Lo
         }
         let references = references.unwrap();
         for lsp_ref in references {
+            resolved_references.push(format!(
+                "{}:{}:{}",
+                *lsp_ref.uri, lsp_ref.range.start.line, lsp_ref.range.start.character
+            ));
             debug!(
                 file = lsp_ref.uri.to_string().as_str(),
                 line_start = lsp_ref.range.start.line,
@@ -469,7 +526,21 @@ async fn resolve_loggers(client: &LspClient, parent: LoggerIdentifier) -> Vec<Lo
                         return boxed_logger_aliases;
                     }
                     let references = references.unwrap();
+
                     for lsp_ref in references {
+                        if resolved_references.contains(&format!(
+                            "{}:{}:{}",
+                            *lsp_ref.uri, lsp_ref.range.start.line, lsp_ref.range.start.character
+                        )) {
+                            debug!(
+                                file = lsp_ref.uri.to_string().as_str(),
+                                line_start = lsp_ref.range.start.line,
+                                column_start = lsp_ref.range.start.character,
+                                "Skipping already resolved reference: {:?}",
+                                lsp_ref,
+                            );
+                            continue;
+                        }
                         let parent = LoggerIdentifier {
                             column_end: range.column_end,
                             column_start: range.column_start,
@@ -477,7 +548,8 @@ async fn resolve_loggers(client: &LspClient, parent: LoggerIdentifier) -> Vec<Lo
                             line_start: range.line_start,
                             uri: lsp_ref.uri.to_string(),
                         };
-                        let inner_aliases = resolve_loggers(client, parent).await;
+                        let inner_aliases =
+                            resolve_loggers(client, parent, false, resolved_references).await;
                         boxed_logger_aliases.extend(inner_aliases);
                     }
                 }
@@ -490,7 +562,29 @@ async fn resolve_loggers(client: &LspClient, parent: LoggerIdentifier) -> Vec<Lo
                             line_start: lsp_ref.range.start.line as usize,
                             uri: lsp_ref.uri.to_string(),
                         },
-                        parent: Some(parent.clone()),
+                        parent: if root { None } else { Some(parent.clone()) },
+                    });
+                }
+                search::TreeSitterSemanticParentRange::AssignmentStatement(range) => {
+                    boxed_logger_aliases.push(LoggerAlias {
+                        identifier: LoggerIdentifier {
+                            column_end: range.column_end,
+                            column_start: range.column_start,
+                            line_end: range.line_end,
+                            line_start: range.line_start,
+                            uri: range.uri.clone(),
+                        },
+                        parent: if root {
+                            None
+                        } else {
+                            Some(LoggerIdentifier {
+                                column_end: lsp_ref.range.end.character as usize,
+                                column_start: lsp_ref.range.start.character as usize,
+                                line_end: lsp_ref.range.end.line as usize,
+                                line_start: lsp_ref.range.start.line as usize,
+                                uri: lsp_ref.uri.to_string(),
+                            })
+                        },
                     });
                 }
             }
@@ -668,6 +762,14 @@ async fn get_with_field_invocations(
                         value: with_field_function.value,
                         uri: uri.to_string(),
                     });
+                } else {
+                    debug!(
+                        file = go_file.to_str(),
+                        line_start = with_field_function.line_start,
+                        column_start = with_field_function.column_start,
+                        line = first_line,
+                        "Found WithField invocation, but it does not match the expected pattern",
+                    );
                 }
             }
         }

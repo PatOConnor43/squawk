@@ -36,7 +36,7 @@ pub fn find_functions_returning_logrus_entry(
         }
         let function_name_node = function_name_node.unwrap();
         let (line_start, column_start, line_end, column_end) =
-            byte_range_to_position(content, function_name_node.byte_range());
+            byte_range_to_position(content, &function_name_node.byte_range());
         results.push(TreeSitterFunctionReturningLogrusEntry {
             filename: filename.to_string(),
             line_start,
@@ -57,11 +57,6 @@ pub fn find_semantic_parent_range_for_logrus_reference(
     column_end: usize,
     filename: &str,
 ) -> Result<TreeSitterSemanticParentRange, anyhow::Error> {
-    // Incoming LSP are 0 based, but tree-sitter is 1 based.
-    //let line_start = line_start.saturating_add(1);
-    //let line_end = line_end.saturating_add(1);
-    //let column_end = column_end.saturating_sub(1);
-
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&LANGUAGE.into())?;
     let tree = parser.parse(content, None);
@@ -94,45 +89,62 @@ pub fn find_semantic_parent_range_for_logrus_reference(
         return Err(e);
     }
     let node = node.unwrap();
-    let mut short_var_declaration_path = vec![
-        "identifier",
-        "call_expression",
-        "expression_list",
-        "short_var_declaration",
-    ];
-    if node.kind() == "identifier" {
-        short_var_declaration_path.remove(0);
-    } else {
+    if node.kind() != "identifier" {
         return Ok(TreeSitterSemanticParentRange::Identity);
     }
 
     // The only pathway that is currently supported is go code that looks like this:
     // 	log := logger()
-    //
-    // 	This should result in a node_path like this:
-    // 	`identifier.call_expression.expression_list.short_var_declaration`
 
+    let original_node_byte_range = node.byte_range();
     let mut n = node.parent();
+    let mut found_short_var_declaration = false;
+    let mut found_assignment_statement = None;
     while n.is_some() {
         let inner = n.unwrap();
-        if &inner.kind() == short_var_declaration_path.first().unwrap() {
-            short_var_declaration_path.remove(0);
-        } else {
+        found_short_var_declaration =
+            inner.child_by_field_name("right").is_some() && inner.kind() == "short_var_declaration";
+        found_assignment_statement = || -> Option<TreeSitterRange> {
+            inner.child_by_field_name("left")?;
+            inner.child_by_field_name("right")?;
+            inner.child_by_field_name("operator")?;
+            if inner.kind() != "assignment_statement" {
+                return None;
+            }
+            let byte_range = inner.child_by_field_name("left").unwrap().byte_range();
+            let c = &content[original_node_byte_range.clone()];
+            dbg!(c);
+            let c = &content[inner.byte_range()];
+            dbg!(c);
+            let range = byte_range_to_position(content, &original_node_byte_range);
+            Some(TreeSitterRange {
+                line_start: range.0,
+                line_end: range.2,
+                column_start: range.1,
+                column_end: range.3,
+                uri: format!("file://{}", filename),
+            })
+        }();
+        if found_short_var_declaration || found_assignment_statement.is_some() {
             break;
         }
-
-        if short_var_declaration_path.is_empty() {
-            return Ok(TreeSitterSemanticParentRange::ShortVarDeclaration(
-                TreeSitterRange {
-                    line_start: inner.start_position().row,
-                    line_end: inner.end_position().row,
-                    column_start: inner.start_position().column,
-                    column_end: inner.end_position().column,
-                },
-            ));
-        }
-
         n = inner.parent();
+    }
+    if found_short_var_declaration {
+        let inner = n.unwrap();
+        return Ok(TreeSitterSemanticParentRange::ShortVarDeclaration(
+            TreeSitterRange {
+                line_start: inner.start_position().row,
+                line_end: inner.end_position().row,
+                column_start: inner.start_position().column,
+                column_end: inner.end_position().column,
+                uri: format!("file://{}", filename),
+            },
+        ));
+    } else if found_assignment_statement.is_some() {
+        return Ok(TreeSitterSemanticParentRange::AssignmentStatement(
+            found_assignment_statement.unwrap(),
+        ));
     }
 
     Ok(TreeSitterSemanticParentRange::Identity)
@@ -172,7 +184,7 @@ pub fn find_fields(
         println!("{}", m.captures.len());
         for node in m.nodes_for_capture_index(0) {
             let (line_start, column_start, line_end, column_end) =
-                byte_range_to_position(content, node.byte_range());
+                byte_range_to_position(content, &node.byte_range());
             println!(
                 "Captured node: {:?}, Text: {}, Range: {}:{}-{}:{}",
                 node,
@@ -201,15 +213,14 @@ pub fn find_with_field(
     }
     let tree = tree.unwrap();
     let query_content = r#"
+;; This query captures WithField being called on a function invocation like:
+;; logger().WithField("key", "value")
 (call_expression
   function: (selector_expression
     operand: (call_expression
       arguments: (argument_list
-        "("
         [(identifier) (raw_string_literal) (interpreted_string_literal)] @arguments.key
-        ","
         [(identifier) (raw_string_literal) (interpreted_string_literal)] @arguments.value
-        ")"
       )
     )
     field: (field_identifier) @method (#eq? @method "WithField")
@@ -238,7 +249,7 @@ pub fn find_with_field(
             "Found WithField call"
         );
         let (line_start, column_start, line_end, column_end) =
-            byte_range_to_position(content, method_node.byte_range());
+            byte_range_to_position(content, &method_node.byte_range());
         results.push(TreeSitterWithFieldFunction {
             filename: filename.to_string(),
             line_start,
@@ -250,6 +261,8 @@ pub fn find_with_field(
         });
     }
     let query_content = r#"
+;; This query captures WithField being called on a struct like:
+;; log.WithField("key", "value")
 (call_expression
   function: (selector_expression
     field: (field_identifier) @method (#eq? @method "WithField")
@@ -284,7 +297,7 @@ pub fn find_with_field(
             "Found WithField call"
         );
         let (line_start, column_start, line_end, column_end) =
-            byte_range_to_position(content, method_node.byte_range());
+            byte_range_to_position(content, &method_node.byte_range());
         results.push(TreeSitterWithFieldFunction {
             filename: filename.to_string(),
             line_start,
@@ -308,6 +321,7 @@ pub struct TreeSitterLoggingFunction {
     pub arguments: String,
 }
 
+#[derive(Debug)]
 pub struct TreeSitterWithFieldFunction {
     pub filename: String,
     pub line_start: usize,
@@ -330,6 +344,7 @@ pub struct TreeSitterFunctionReturningLogrusEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeSitterSemanticParentRange {
     ShortVarDeclaration(TreeSitterRange), // (line_start, column_start)
+    AssignmentStatement(TreeSitterRange), // (line_start, column_start)
     // Identity is used to signal that this is a terminal node and there is nothing else to find.
     Identity,
 }
@@ -340,6 +355,7 @@ pub struct TreeSitterRange {
     pub line_end: usize,
     pub column_start: usize,
     pub column_end: usize,
+    pub uri: String,
 }
 
 pub fn find_logging_function(
@@ -376,7 +392,7 @@ pub fn find_logging_function(
         let arguments_node = arguments_node.unwrap();
 
         let (line_start, column_start, line_end, column_end) =
-            byte_range_to_position(content, method_node.byte_range());
+            byte_range_to_position(content, &method_node.byte_range());
         results.push(TreeSitterLoggingFunction {
             filename: filename.to_string(),
             line_start,
@@ -392,7 +408,7 @@ pub fn find_logging_function(
 
 pub fn byte_range_to_position(
     content: &str,
-    byte_range: std::ops::Range<usize>,
+    byte_range: &std::ops::Range<usize>,
 ) -> (usize, usize, usize, usize) {
     let mut line_start = 1;
     let mut column_start = 1;
