@@ -76,3 +76,17 @@ Each of these cases are distinct and will need separate mixing of treesitter que
 
 No, not yet. Maybe never.
 
+## Update
+
+I'm putting this on ice for now. There are too many problems that I knew would be difficult to solve but I wanted to run into the wall anyway. Here are some of the problems I ran into:
+- Using a variable as a key or value in a call to WithField makes is pretty difficult to resolve. Maybe you get lucky and it's a constant that you can look up with the LSP but that isn't guranteed. This goes the same (but differently) for function calls.
+- Gopls is helpful in the wrong ways. I was really hoping to build  a series of "pointers" to logging fields. I was hoping that calling `References` with the language server would allow me to build that graph of logging fields. The speceific problem is that when you call `References` on a variable, you might actually also get references _after_ a variable is reassigned. Consider this example:
+```go
+l := logger().WithField("1", "1")
+l = l.WithField("2", "2")
+l.WithField("3", "3").Info("Hello")
+```
+
+I was hoping that calling `References` on `l` would only give me the second reference on the second line, then I could call references again on the first reference on the second line. Instead, I get all three references. This is a problem because I can't follow the specific chain of references. A work around could be to pre-process the references and see if there are any assignments between the references, but I don't know if that would work in all cases.
+
+Anyway, it was a very fun project to work on and I learned a ton about Treesitter and the Language Server Protocol. I would be surprised if this is the last time I try to do some kind of static code analysis with Treesitter and the LSP.
